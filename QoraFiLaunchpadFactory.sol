@@ -324,6 +324,17 @@ contract QoraFiLaunchpadFactory is Ownable, ReentrancyGuard, IQoraFiLaunchpadFac
     }
 
     /**
+     * @notice Get information about burned LP tokens for a migrated token
+     * @param _token Token address to check burned LP tokens for
+     * @return burnAddress Address where LP tokens are burned
+     * @return burnedAmount Amount of LP tokens burned
+     */
+    function getBurnedLPTokenInfo(address _token) external view returns (address burnAddress, uint256 burnedAmount) {
+        if (!isDeployedToken[_token]) revert TokenNotDeployed();
+        return QoraFiLaunchpadVesting(_token).getBurnedLPInfo();
+    }
+
+    /**
      * @notice Check deadline status for a token
      */
     function checkTokenDeadline(address _token) external view returns (
