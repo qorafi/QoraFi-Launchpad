@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {ISecurityManager} from "../interfaces/SecurityInterfaces.sol";
 
@@ -30,6 +31,7 @@ interface IUniswapV2Factory {
  * @notice Core trading logic for QoraFi token with bonding curve
  */
 contract QoraFiTokenCore is ERC20, ReentrancyGuard {
+    using SafeERC20 for IERC20;
     
     // --- Security Manager ---
     ISecurityManager public immutable securityManager;
@@ -99,7 +101,7 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
 
     // --- Key Addresses ---
     address public immutable creator;
-    address public immutable pair;
+    address public pair;
     address public immutable treasury;
     address public immutable dexTreasury;
     address public immutable factory;
@@ -116,6 +118,7 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
     uint256 public immutable deadlineDuration;
     uint256 public immutable launchTime;
     bool public saleCancelled;
+    uint256 public lpLaunchPrice; // Price per token at LP launch (in wei per token)
 
     // --- Uniswap Integration ---
     IUniswapV2Router02 public immutable uniswapV2Router;
@@ -132,6 +135,8 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
     event SaleCancelled(uint256 timestamp, string reason);
     event LaunchScheduled(uint256 launchTime, uint256 deadline);
     event LaunchActivated(uint256 timestamp);
+    event LPTokensBurned(address indexed pair, uint256 amount, address indexed burnAddress);
+    event LPLaunchPriceSet(uint256 pricePerToken, uint256 tokensInLP, uint256 ethInLP);
 
     // --- Custom Errors ---
     error SaleNotActive();
@@ -373,13 +378,49 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
         tokensToBurn = tokensRemaining - tokensToMigrate;
         collateralAmount = address(this).balance - fixedMigrationFee - poolCreationFee;
         
+        // Burn excess tokens
         _burn(address(this), tokensToBurn);
         
-        migrationTimestamp = block.timestamp;
-        currentState = TokenState.Migrated;
+        // Create Uniswap pair if it doesn't exist
+        address uniswapFactory = uniswapV2Router.factory();
+        if (IUniswapV2Factory(uniswapFactory).getPair(address(this), uniswapV2Router.WETH()) == address(0)) {
+            pair = IUniswapV2Factory(uniswapFactory).createPair(address(this), uniswapV2Router.WETH());
+        }
         
-        emit TokensMigrated(pair, tokensToMigrate, collateralAmount);
-        emit StateChanged(TokenState.Succeeded, TokenState.Migrated);
+        // Approve router to spend tokens using forceApprove pattern
+        IERC20(address(this)).forceApprove(address(uniswapV2Router), tokensToMigrate);
+        
+        // Add liquidity to Uniswap - LP tokens will be burned (sent to dead address)
+        try uniswapV2Router.addLiquidityETH{value: collateralAmount}(
+            address(this),
+            tokensToMigrate,
+            tokensToMigrate * 95 / 100, // 5% slippage tolerance for tokens
+            collateralAmount * 95 / 100, // 5% slippage tolerance for ETH
+            0x000000000000000000000000000000000000dEaD, // LP tokens burned (sent to dead address)
+            block.timestamp + 300 // 5 minute deadline
+        ) returns (uint256 amountToken, uint256 amountETH, uint256 liquidity) {
+            // Reset allowance after successful liquidity addition
+            IERC20(address(this)).forceApprove(address(uniswapV2Router), 0);
+            
+            migrationTimestamp = block.timestamp;
+            currentState = TokenState.Migrated;
+            
+            // Calculate LP launch price: ETH per token (in wei per token)
+            lpLaunchPrice = (amountETH * 1e18) / amountToken;
+            
+            emit TokensMigrated(pair, amountToken, amountETH);
+            emit LPTokensBurned(pair, liquidity, 0x000000000000000000000000000000000000dEaD);
+            emit LPLaunchPriceSet(lpLaunchPrice, amountToken, amountETH);
+            emit StateChanged(TokenState.Succeeded, TokenState.Migrated);
+            
+            // Return actual amounts used
+            tokensToMigrate = amountToken;
+            collateralAmount = amountETH;
+        } catch {
+            // Reset allowance on failure
+            IERC20(address(this)).forceApprove(address(uniswapV2Router), 0);
+            revert("Migration failed: liquidity addition unsuccessful");
+        }
     }
 
     // --- Internal Helper Functions ---
@@ -490,6 +531,35 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
         return buyersList.length;
     }
 
+    function getLPLaunchPrice() external view returns (uint256 pricePerToken, bool isSet) {
+        pricePerToken = lpLaunchPrice;
+        isSet = (currentState == TokenState.Migrated && lpLaunchPrice > 0);
+    }
+
+    function getMigrationInfo() external view returns (
+        bool canMigrate,
+        uint256 tokensToMigrate,
+        uint256 tokensToBurn,
+        uint256 collateralForLP,
+        address pairAddress
+    ) {
+        canMigrate = (currentState == TokenState.Succeeded && !saleCancelled);
+        
+        if (canMigrate) {
+            uint256 tokensRemaining = balanceOf(address(this));
+            tokensToMigrate = tokensRemaining * 80 / 100;
+            tokensToBurn = tokensRemaining - tokensToMigrate;
+            collateralForLP = address(this).balance - fixedMigrationFee - poolCreationFee;
+        }
+        
+        pairAddress = pair;
+    }
+
+    function getLPTokenBalance() external pure returns (uint256) {
+        // LP tokens are burned to dead address, so always return 0
+        return 0;
+    }
+
     function getTokensForEth(uint256 _ethAmount) external view returns (uint256, uint256) {
         uint256 fee = _ethAmount * feeBPS / MAX_BPS;
         uint256 netAmount = _ethAmount - fee;
@@ -509,6 +579,22 @@ contract QoraFiTokenCore is ERC20, ReentrancyGuard {
     function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
         if (to == pair && sendingToPairNotAllowed) revert SendingToPairIsNotAllowedBeforeMigration();
         return super.transferFrom(from, to, amount);
+    }
+
+    // --- LP Token Information ---
+    
+    /**
+     * @notice Get burned LP token information
+     * @return deadAddress The address where LP tokens are burned
+     * @return burnedAmount Amount of LP tokens burned (if migration completed)
+     */
+    function getBurnedLPInfo() external view returns (address deadAddress, uint256 burnedAmount) {
+        deadAddress = 0x000000000000000000000000000000000000dEaD;
+        if (currentState == TokenState.Migrated && pair != address(0)) {
+            burnedAmount = IERC20(pair).balanceOf(deadAddress);
+        } else {
+            burnedAmount = 0;
+        }
     }
 
     // --- Security View Functions ---
